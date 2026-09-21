@@ -335,6 +335,9 @@ impl KrApi for MockApi {
         if let Some(kind) = failure.or(path_failure) {
             return Err(match kind {
                 "auth" => ApiError::AuthExpired,
+                "gone" => ApiError::BrowserGone {
+                    detail: "the response channel closed".into(),
+                },
                 "cloudflare" => ApiError::Cloudflare {
                     detail: "API response, status 403, cf-mitigated: challenge".into(),
                 },

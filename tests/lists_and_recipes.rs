@@ -239,6 +239,7 @@ async fn an_ignored_share_is_reported() -> anyhow::Result<()> {
 
     assert!(err.contains("sharing it"), "{err}");
     assert!(err.contains(LIST_ID), "{err}");
+    assert!(err.contains("Kauppalista 21.9"), "{err}");
     Ok(())
 }
 
@@ -261,5 +262,33 @@ async fn a_failing_share_call_names_the_list_that_now_exists() -> anyhow::Result
     assert!(matches!(failure, support::Failure::ToolError(_)));
     assert!(failure.text().contains(LIST_ID), "{}", failure.text());
     assert!(failure.text().contains("sharing it"), "{}", failure.text());
+    // The rename already worked, so the list is no longer called "Ostoskori".
+    assert!(failure.text().contains("Kauppalista 21.9"), "{}", failure.text());
+    assert!(!failure.text().contains("Ostoskori"), "{}", failure.text());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lost_creation_response_is_reported_as_uncertain() -> anyhow::Result<()> {
+    let api = MockApi::new()
+        .with_item(BANANA, 1.0, "kpl")
+        .failing_on("/from/basket/", "gone");
+    let (client, api) = connect(api).await?;
+
+    let err = call_tool(
+        &client,
+        "save_cart_as_list",
+        json!({"store_id": STORE, "name": "Kauppalista 21.9", "share_with_household": true}),
+    )
+    .await
+    .unwrap_err();
+
+    assert!(err.contains("may already have been created"), "{err}");
+    assert!(err.contains("not repeated"), "{err}");
+    let posts = list_calls(&api)
+        .iter()
+        .filter(|c| c.method == "POST")
+        .count();
+    assert_eq!(posts, 1);
     Ok(())
 }

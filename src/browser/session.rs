@@ -169,6 +169,21 @@ pub trait KrApi: Send + Sync {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, ApiError>;
+
+    /// Like [`KrApi::call`], for a request that must not be sent twice (one that creates
+    /// something). A stale-build refusal is still retried, since the server rejected the
+    /// request, but a lost connection or a block is returned as it is: the server may
+    /// already have acted, and relaunching to repeat the request could act twice.
+    ///
+    /// Defaults to `call` so a fake that never replays needs nothing more.
+    async fn call_once(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, ApiError> {
+        self.call(method, path, body).await
+    }
 }
 
 #[async_trait::async_trait]
@@ -180,6 +195,15 @@ impl KrApi for Session {
         body: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, ApiError> {
         self.api(method, path, body).await
+    }
+
+    async fn call_once(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, ApiError> {
+        self.api_with(method, path, body, false).await
     }
 }
 
@@ -770,10 +794,22 @@ impl Session {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value, ApiError> {
+        self.api_with(method, path, body, true).await
+    }
+
+    /// [`Session::api`], where `replayable: false` forbids relaunching the browser and
+    /// sending the request again, because the first attempt may have reached the server.
+    async fn api_with(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&serde_json::Value>,
+        replayable: bool,
+    ) -> Result<serde_json::Value, ApiError> {
         let _activity = self.begin_browser_activity().await;
         let mut relaunched = false;
         let mut refreshed_build = false;
-        let relaunch_would_hurt = relaunch_costs_a_human_their_login(self.mode);
+        let relaunch_would_hurt = !replayable || relaunch_costs_a_human_their_login(self.mode);
         loop {
             let (generation, result) = self.attempt_once(method, path, body).await;
             let error = match result {

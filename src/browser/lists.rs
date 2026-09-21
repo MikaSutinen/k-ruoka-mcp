@@ -52,7 +52,13 @@ impl<'a> Lists<'a> {
             "/kr-api/shopping-lists/from/basket/{}?storeId={store}",
             percent_encode(&basket.id)
         );
-        let created: ShoppingList = parse(self.api.call("POST", &path, None).await?)?;
+        // Never replayed: a second attempt after a lost response could make a second list.
+        let response = self
+            .api
+            .call_once("POST", &path, None)
+            .await
+            .map_err(creation_may_have_succeeded)?;
+        let created: ShoppingList = parse(response)?;
         if created.id.is_empty() {
             return Err(ApiError::Other(anyhow::anyhow!(
                 "K-Ruoka answered without a list id, so the list may not have been created"
@@ -95,14 +101,14 @@ impl<'a> Lists<'a> {
             });
             let settings: ShareSettings = self
                 .step(
-                    &created,
+                    &renamed,
                     "sharing it",
                     self.api.call("PATCH", &path, Some(&body)),
                 )
                 .await?;
             if !settings.can_write_with_household_access {
                 return Err(partial(
-                    &created,
+                    &renamed,
                     "sharing it",
                     "K-Ruoka answered 200 but the household still cannot edit the list",
                 ));
@@ -132,6 +138,20 @@ impl<'a> Lists<'a> {
             .map_err(|e| partial(created, what, &e.to_string()))?;
         serde_json::from_value(value)
             .map_err(|e| partial(created, what, &format!("unexpected response shape: {e}")))
+    }
+}
+
+/// A failure where the server may or may not have acted. The request was not repeated, so
+/// the list could exist even though this call reports failure.
+fn creation_may_have_succeeded(error: ApiError) -> ApiError {
+    match error {
+        ApiError::BrowserGone { .. } | ApiError::Cloudflare { .. } => {
+            ApiError::Other(anyhow::anyhow!(
+                "{error}. The list may already have been created and the request was not \
+                 repeated: check the shopping lists in the K-Ruoka account before trying again."
+            ))
+        }
+        other => other,
     }
 }
 
