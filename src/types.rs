@@ -645,6 +645,215 @@ impl From<PersonalOfferProduct> for PersonalOfferProductView {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Recipes
+// ---------------------------------------------------------------------------
+
+/// Recipe text is `{"fi": ..., "sv": ..., "en": ...}`, unlike products, which use
+/// `finnish`/`english`. Any of them can be `null`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FiText {
+    #[serde(default)]
+    pub fi: Option<String>,
+}
+
+impl FiText {
+    fn text(field: &Option<FiText>) -> Option<String> {
+        field
+            .as_ref()
+            .and_then(|t| t.fi.as_deref())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+    }
+}
+
+/// `GET /kr-api/v1/search?q=...`
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeSearchResponse {
+    #[serde(default)]
+    pub total_hits: u64,
+    #[serde(default)]
+    pub result: Vec<RecipeHit>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RecipeHit {
+    pub recipe: Recipe,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Recipe {
+    #[serde(default)]
+    pub name: Option<FiText>,
+    #[serde(default)]
+    pub slug: Option<FiText>,
+    #[serde(default)]
+    pub prep_time: Option<FiText>,
+    /// A string ("3") in every response seen, but read as a raw value so a number
+    /// would not fail the whole search.
+    #[serde(default)]
+    pub serving_count_label: Option<serde_json::Value>,
+    #[serde(default)]
+    pub serving_count_unit: Option<FiText>,
+    #[serde(default)]
+    pub ingredients: Vec<RecipeIngredient>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeIngredient {
+    /// The product K-Ruoka itself links to this ingredient. Absent for things with no
+    /// product behind them.
+    #[serde(default)]
+    pub ean: Option<String>,
+    #[serde(default)]
+    pub product_spelling: Option<FiText>,
+    /// A string such as "1/2", not a number.
+    #[serde(default)]
+    pub amount: Option<FiText>,
+    #[serde(default)]
+    pub unit: Option<FiText>,
+    #[serde(default)]
+    pub additional_info: Option<FiText>,
+    #[serde(default)]
+    pub is_alternative_ingredient: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeSearchView {
+    /// How many recipes match in total, usually more than `recipes`.
+    pub total_hits: u64,
+    pub recipes: Vec<RecipeView>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeView {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
+    /// e.g. "4 annosta".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub servings: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prep_time: Option<String>,
+    pub ingredients: Vec<IngredientView>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct IngredientView {
+    /// Pass this as `ean` to `add_to_cart`. Absent when the ingredient has no product.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ean: Option<String>,
+    pub name: String,
+    /// As written in the recipe, e.g. "1/2". K-Ruoka sells packs, so this is a guide to
+    /// how much is needed, not a quantity to pass to `add_to_cart`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// e.g. "(400 g)".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// An "or" substitute for the ingredient before it. Skip it when buying the main one.
+    pub is_alternative: bool,
+}
+
+impl From<Recipe> for RecipeView {
+    fn from(r: Recipe) -> Self {
+        let servings = match (
+            r.serving_count_label.as_ref().and_then(|v| match v {
+                serde_json::Value::String(s) => Some(s.trim().to_string()),
+                serde_json::Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }),
+            FiText::text(&r.serving_count_unit),
+        ) {
+            (Some(n), Some(unit)) if !n.is_empty() => Some(format!("{n} {unit}")),
+            (Some(n), None) if !n.is_empty() => Some(n),
+            _ => None,
+        };
+        Self {
+            name: FiText::text(&r.name).unwrap_or_default(),
+            slug: FiText::text(&r.slug),
+            servings,
+            prep_time: FiText::text(&r.prep_time),
+            ingredients: r.ingredients.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<RecipeIngredient> for IngredientView {
+    fn from(i: RecipeIngredient) -> Self {
+        Self {
+            ean: i.ean.filter(|e| !e.trim().is_empty()),
+            name: FiText::text(&i.product_spelling).unwrap_or_default(),
+            amount: FiText::text(&i.amount),
+            unit: FiText::text(&i.unit),
+            note: FiText::text(&i.additional_info),
+            is_alternative: i.is_alternative_ingredient,
+        }
+    }
+}
+
+impl RecipeSearchView {
+    /// `limit` applies here as well as in the request: the payload for a full page is
+    /// far larger than a model needs, and the endpoint's own page size is not a promise.
+    pub fn from_response(r: RecipeSearchResponse, limit: usize) -> Self {
+        Self {
+            total_hits: r.total_hits,
+            recipes: r
+                .result
+                .into_iter()
+                .take(limit)
+                .map(|hit| hit.recipe.into())
+                .collect(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shopping lists
+// ---------------------------------------------------------------------------
+
+/// A saved list, as returned by `POST /kr-api/shopping-lists/from/basket/{id}` and by
+/// the rename `PATCH`. Only what the guards and the view need.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShoppingList {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub items: Vec<serde::de::IgnoredAny>,
+    #[serde(default)]
+    pub can_write_with_household_access: bool,
+}
+
+/// `PATCH /kr-api/shopping-lists/{id}/share`
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareSettings {
+    #[serde(default)]
+    pub can_write_with_household_access: bool,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedListView {
+    pub list_id: String,
+    pub name: String,
+    pub items_in_cart: usize,
+    pub items_on_list: usize,
+    /// Whether the household can edit the list.
+    pub shared_with_household: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

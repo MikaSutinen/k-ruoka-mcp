@@ -14,11 +14,14 @@ use serde::Deserialize;
 use crate::browser::KrApi;
 use crate::browser::basket::Cart;
 use crate::browser::catalog::Catalog;
+use crate::browser::lists::Lists;
 use crate::browser::offers::Offers;
+use crate::browser::recipes::Recipes;
 use crate::browser::session::ApiError;
 use crate::login_flow::{LoginFlow, LoginProgress};
 use crate::types::{
-    CartView, DEFAULT_UNIT, PersonalOffersView, ProductSearchView, StoreSearchView,
+    CartView, DEFAULT_UNIT, PersonalOffersView, ProductSearchView, RecipeSearchView, SavedListView,
+    StoreSearchView,
 };
 
 /// Used on argument structs where the caller must always supply a store id.
@@ -92,6 +95,30 @@ pub struct SearchStoresArg {
     pub query: String,
     #[schemars(description = LIMIT_DESC)]
     pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchRecipesArg {
+    #[schemars(
+        description = "Dish name or ingredient, in Finnish, e.g. \"makaronilaatikko\" or \
+                              \"lasagne\"."
+    )]
+    pub query: String,
+    #[schemars(description = "How many recipes to return. Defaults to 5, capped at 10.")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SaveCartAsListArg {
+    #[schemars(description = STORE_ID_OPT_DESC)]
+    pub store_id: Option<String>,
+    #[schemars(description = "Name for the saved list, e.g. \"Kauppalista 21.9\".")]
+    pub name: String,
+    #[schemars(
+        description = "Let the account's household edit the list. Defaults to false, \
+                              meaning the list stays private."
+    )]
+    pub share_with_household: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -304,6 +331,14 @@ impl CartServer {
 
     fn offers(&self) -> Offers<'_> {
         Offers::new(&*self.api)
+    }
+
+    fn recipes(&self) -> Recipes<'_> {
+        Recipes::new(&*self.api)
+    }
+
+    fn lists(&self) -> Lists<'_> {
+        Lists::new(&*self.api)
     }
 }
 
@@ -604,6 +639,60 @@ impl CartServer {
     }
 
     #[tool(
+        annotations(
+            title = "Search recipes",
+            read_only_hint = true,
+            idempotent_hint = true
+        ),
+        description = "Find recipes by dish name or ingredient and get their ingredients. \
+                       Read-only. Each ingredient carries the `ean` of the product \
+                       K-Ruoka links to it, so it can go straight to add_to_cart. Amounts \
+                       are as written in the recipe (e.g. \"1/2 dl\"), not pack counts. \
+                       Ingredients marked `isAlternative` are substitutes for the one \
+                       before them. Search in Finnish."
+    )]
+    async fn search_recipes(
+        &self,
+        Parameters(arg): Parameters<SearchRecipesArg>,
+    ) -> Result<Json<RecipeSearchView>, ToolFailure> {
+        let found = self
+            .recipes()
+            .search(&arg.query, arg.limit)
+            .await
+            .map_err(to_tool_failure)?;
+        Ok(Json(found))
+    }
+
+    #[tool(
+        annotations(
+            title = "Save the cart as a shopping list",
+            destructive_hint = false,
+            idempotent_hint = false
+        ),
+        description = "Save everything in the cart as a named shopping list in the account, \
+                       optionally shared with the household. The cart itself is left as it \
+                       is. Each call creates a new list, so calling it twice makes two. \
+                       Refuses an empty cart. If the list is created but naming or sharing \
+                       it fails, the error names the list so it can be fixed by hand."
+    )]
+    async fn save_cart_as_list(
+        &self,
+        Parameters(arg): Parameters<SaveCartAsListArg>,
+    ) -> Result<Json<SavedListView>, ToolFailure> {
+        let store_id = self.resolve_store(arg.store_id)?;
+        let saved = self
+            .lists()
+            .save_cart(
+                &store_id,
+                &arg.name,
+                arg.share_with_household.unwrap_or(false),
+            )
+            .await
+            .map_err(to_tool_failure)?;
+        Ok(Json(saved))
+    }
+
+    #[tool(
         annotations(title = "Check sign-in", read_only_hint = true, idempotent_hint = true),
         description = "Check whether the stored K-Plussa session is still logged in. Cheap. \
                        Worth calling first if a cart operation behaves unexpectedly, because \
@@ -672,6 +761,9 @@ impl ServerHandler for CartServer {
              anonymous one rather than the user's. Call `start_login` and relay its \
              instructions verbatim, then poll `login_status`. Credentials are never \
              automated and this server never sees them.\n\n\
+             `search_recipes` returns recipes with ingredient EANs that `add_to_cart` \
+             accepts, and `save_cart_as_list` turns the cart into a named list in the \
+             account.\n\n\
              Checkout is deliberately not supported: nothing here can spend money.",
             )
     }

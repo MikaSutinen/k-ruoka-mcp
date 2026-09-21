@@ -89,7 +89,7 @@ fn clamp_limit(limit: Option<u32>) -> u32 {
 /// deliberately conservative (unreserved characters only), so anything else -- spaces,
 /// Finnish letters, `?`, `&`, `#`, `/` -- is escaped rather than being able to change
 /// which URL is requested.
-fn percent_encode(value: &str) -> String {
+pub(crate) fn percent_encode(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {

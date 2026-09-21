@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 pub const STORE: &str = "N137";
 pub const STORE_NAME: &str = "K-Citymarket Helsinki Ruoholahti";
 pub const BASKET_ID: &str = "c0fa67a6-4b56-4dc6-9a7e-506c2b29b7cf";
+pub const LIST_ID: &str = "07832398-a986-4d72-8be4-250140e11230";
 
 /// A real EAN, and the shape K-Ruoka returns for it.
 pub const BANANA: &str = "2000818700008";
@@ -90,6 +91,10 @@ struct State {
     /// Event types to record, answer 200 to, and then ignore. K-Ruoka's signature
     /// move: success with nothing changed.
     deaf_to: Vec<&'static str>,
+    /// `(path fragment, failure kind)`: fail only the calls whose path contains it.
+    fail_paths: Vec<(&'static str, &'static str)>,
+    /// The name of the list made from the cart, once there is one.
+    list_name: String,
 }
 
 #[derive(Clone, Default)]
@@ -132,6 +137,13 @@ impl MockApi {
     /// the *result* is indistinguishable from one that checks the status.
     pub fn deaf_to(self, event_type: &'static str) -> Self {
         self.state.lock().unwrap().deaf_to.push(event_type);
+        self
+    }
+
+    /// Fail only the calls whose path contains `fragment`, leaving the rest normal. For
+    /// reaching a late step of a multi-call operation.
+    pub fn failing_on(self, fragment: &'static str, kind: &'static str) -> Self {
+        self.state.lock().unwrap().fail_paths.push((fragment, kind));
         self
     }
 
@@ -315,7 +327,12 @@ impl KrApi for MockApi {
                 }
             }
         };
-        if let Some(kind) = failure {
+        let path_failure = state
+            .fail_paths
+            .iter()
+            .find(|(fragment, _)| path.contains(fragment))
+            .map(|(_, kind)| *kind);
+        if let Some(kind) = failure.or(path_failure) {
             return Err(match kind {
                 "auth" => ApiError::AuthExpired,
                 "cloudflare" => ApiError::Cloudflare {
@@ -428,6 +445,78 @@ impl KrApi for MockApi {
                     },
                 ],
             }));
+        }
+
+        // Recipe search. Shaped like the live response: names are `fi`/`sv`/`en`, amounts
+        // are strings, one ingredient has no product behind it, and one is an alternative.
+        if path.starts_with("/kr-api/v1/search?") {
+            let ingredient =
+                |ean: Option<&str>, name: &str, amount: &str, unit: &str, alt: bool| {
+                    json!({
+                        "ean": ean,
+                        "productSpelling": {"fi": name, "sv": null, "en": null},
+                        "amount": {"fi": amount, "sv": null, "en": null},
+                        "unit": {"fi": unit, "sv": null, "en": null},
+                        "additionalInfo": null,
+                        "isAlternativeIngredient": alt,
+                    })
+                };
+            let recipe = |name: &str, slug: &str, ingredients: Vec<Value>| {
+                json!({"recipe": {
+                    "name": {"fi": name, "sv": null, "en": null},
+                    "slug": {"fi": slug, "sv": null, "en": null},
+                    "prepTime": {"fi": "30 - 60 min", "sv": null, "en": null},
+                    "servingCountLabel": "4",
+                    "servingCountUnit": {"fi": "annosta", "sv": null, "en": null},
+                    "ingredients": ingredients,
+                }, "ratingSummary": {"average": 3.8}})
+            };
+            return Ok(json!({
+                "totalHits": 16,
+                "searchQuery": "makaroni",
+                "result": [
+                    recipe("Makaronilaatikko", "makaronilaatikko", vec![
+                        ingredient(Some("6410405327888"), "Pirkka makaroni", "400", "g", false),
+                        ingredient(Some("6408430001323"), "Valio kahvimaito", "1/2", "dl", false),
+                        ingredient(None, "vesi", "1", "dl", false),
+                        ingredient(Some("6410405179586"), "Pirkka kaurajuoma", "1/2", "dl", true),
+                    ]),
+                    recipe("Tonnikalamakaroni", "tonnikalamakaroni", vec![
+                        ingredient(Some("6410405327888"), "Pirkka makaroni", "300", "g", false),
+                    ]),
+                    recipe("Makaronisalaatti", "makaronisalaatti", vec![]),
+                ],
+            }));
+        }
+
+        // Saved lists. K-Ruoka names a new list "Ostoskori", and answers 200 to a rename or
+        // a share whether or not it took; `deaf_to("RENAME-LIST")` / `("SHARE-LIST")` model
+        // the second half of that.
+        if path.starts_with("/kr-api/shopping-lists/from/basket/") {
+            state.list_name = "Ostoskori".to_string();
+            let items: Vec<Value> = state
+                .items
+                .iter()
+                .map(|(_, ean, amount, unit)| json!({"id": ean, "type": "product", "ean": ean, "amountInfo": {"unit": unit, "amount": amount}}))
+                .collect();
+            return Ok(
+                json!({"id": LIST_ID, "name": state.list_name, "items": items,
+                             "canWriteWithHouseholdAccess": false}),
+            );
+        }
+        if method == "PATCH" && path.starts_with("/kr-api/shopping-lists/") {
+            if path.contains("/share?") || path.ends_with("/share") {
+                let allowed = !state.deaf_to.contains(&"SHARE-LIST");
+                return Ok(json!({"shareKey": null, "canReadWithShareAccess": false,
+                                 "canWriteWithShareAccess": false,
+                                 "canWriteWithHouseholdAccess": allowed}));
+            }
+            if !state.deaf_to.contains(&"RENAME-LIST")
+                && let Some(name) = body.and_then(|b| b["name"].as_str())
+            {
+                state.list_name = name.to_string();
+            }
+            return Ok(json!({"id": LIST_ID, "name": state.list_name, "items": []}));
         }
 
         if path.starts_with("/kr-api/basket/by-id/")
