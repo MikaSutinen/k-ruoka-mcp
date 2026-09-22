@@ -207,6 +207,27 @@ impl KrApi for Session {
     }
 }
 
+/// Names of the files Chrome's `ProcessSingleton` leaves in a profile directory to
+/// claim it. All three are meaningless once the Chrome that made them is gone, and
+/// removing them is what lets a fresh launch reclaim a profile that Chrome itself
+/// won't self-clean (see `launch`'s comment for when that happens).
+const SINGLETON_FILES: [&str; 3] = ["SingletonLock", "SingletonCookie", "SingletonSocket"];
+
+/// Best-effort: remove any of Chrome's `Singleton*` files found directly in `profile`.
+///
+/// Never errors -- a missing file is the common case, and a permission failure here
+/// should surface from the launch it was trying to unblock, not from this step.
+fn clear_stale_singleton_lock(profile: &Path) {
+    for name in SINGLETON_FILES {
+        let path = profile.join(name);
+        // `remove_file` unlinks a symlink itself rather than its (possibly already
+        // gone) target, which is exactly what a stale `SingletonLock` is.
+        if std::fs::remove_file(&path).is_ok() {
+            eprintln!("k-ruoka-mcp: cleared stale {name} in {}", profile.display());
+        }
+    }
+}
+
 /// What to do about a failed attempt. Extracted from [`Session::api`]'s loop so the
 /// policy can be tested exhaustively without a browser.
 #[derive(Debug, PartialEq, Eq)]
@@ -561,6 +582,16 @@ impl Session {
     }
 
     async fn launch(&self) -> Result<Live> {
+        // A profile supports exactly one Chrome at a time, and `self.live`'s mutex is
+        // held across every teardown-then-launch this type does, so a lock left behind
+        // here can only be from a Chrome this process no longer has, or never had: one
+        // killed without the chance to unlink it (OOM, `docker kill`, a host reboot), or
+        // one from a previous incarnation of the profile's directory (a container
+        // recreated against the same named volume gets a new hostname, which is the
+        // *other* half of Chrome's own staleness check and stops it clearing the lock
+        // itself). Removing it before every launch is what `pkill` would otherwise be
+        // needed for, and the caller has no shell to run one from.
+        clear_stale_singleton_lock(&self.profile);
         let mut builder = BrowserConfig::builder()
             .chrome_executable(chrome_path())
             .user_data_dir(&self.profile)
@@ -579,10 +610,11 @@ impl Session {
 
         let (browser, mut handler) = Browser::launch(config).await.with_context(|| {
             format!(
-                "launching Chrome against profile {}. A Chrome left over from an \
-                 earlier run can hold the profile's lock -- check for one \
-                 (pkill -f {}) before considering the profile itself broken, because \
-                 it holds your login and re-running `login` is the only way back.",
+                "launching Chrome against profile {}. Its stale-lock files are cleared \
+                 before every launch, so a Chrome still genuinely running against this \
+                 profile (check for one: pkill -f {}) is the likely cause, not a corrupt \
+                 profile -- it holds your login and re-running `login` is the only way \
+                 back.",
                 self.profile.display(),
                 self.profile.display()
             )
@@ -1404,6 +1436,43 @@ fn platform_data_dir() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exact scenario a crash or a container recreation leaves behind: a
+    /// `SingletonLock` symlink whose target is gone (or on a host that no longer
+    /// exists). `launch` must be able to reclaim the profile without a human running
+    /// `pkill`, since the caller has no shell to run one from.
+    #[test]
+    fn a_stale_singleton_lock_is_cleared_before_launch() {
+        let dir = std::env::temp_dir().join("k-ruoka-singleton-lock-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in SINGLETON_FILES {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("some-other-host-12345", dir.join(name)).unwrap();
+            #[cfg(not(unix))]
+            std::fs::write(dir.join(name), b"some-other-host-12345").unwrap();
+        }
+
+        clear_stale_singleton_lock(&dir);
+
+        for name in SINGLETON_FILES {
+            assert!(
+                std::fs::symlink_metadata(dir.join(name)).is_err(),
+                "{name} should have been removed"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The common case -- no leftover Chrome -- must stay a no-op, not an error.
+    #[test]
+    fn clearing_a_profile_with_no_lock_does_not_panic() {
+        let dir = std::env::temp_dir().join("k-ruoka-singleton-lock-test-empty");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        clear_stale_singleton_lock(&dir);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// Windows has nothing else to fall back on: `chrome.exe --version` is not asked
     /// there, so this read is the whole version lookup on that platform.
